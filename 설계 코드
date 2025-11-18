@@ -1,0 +1,169 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sys/socket.h>      // 소켓 관련 함수 선언
+#include <arpa/inet.h>       // IP 주소 변환 함수 사용
+#include <netinet/ip.h>      // IP 헤더 구조체 정의 포함
+#include <linux/if_packet.h> // RAW 소켓과 이더넷 헤더 정의
+#include <net/ethernet.h>    // 이더넷 프로토콜 상수 포함
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+
+// IP 헤더 출력 함수
+void print_ip_header(unsigned char *buffer) {
+    struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr)); // 이더넷 헤더 크기만큼 건너뜀
+    struct sockaddr_in src, dst;
+
+    src.sin_addr.s_addr = iph->saddr; // 출발지 주소
+    dst.sin_addr.s_addr = iph->daddr; // 목적지 주소
+
+    // IP 주소와 프로토콜 번호 출력
+    printf("========== IP 헤더 정보 ==========\n");
+    printf("출발지 IP: %s\n", inet_ntoa(src.sin_addr));
+    printf("목적지 IP: %s\n", inet_ntoa(dst.sin_addr));
+    printf("프로토콜 번호: %u\n\n", (unsigned int)iph->protocol);
+}
+
+// TCP 상태 정의
+typedef enum {
+    TCP_NONE = 0,
+    TCP_SYN_SENT,
+    TCP_SYN_RECV,
+    TCP_ESTABLISHED,
+    TCP_FIN_WAIT,
+    TCP_CLOSED
+} tcp_state_t;
+
+// TCP 연결 정보
+typedef struct tcp_conn {
+    uint32_t saddr, daddr;
+    uint16_t sport, dport;
+    tcp_state_t state;
+    struct tcp_conn *next;
+} tcp_conn_t;
+
+tcp_conn_t *conn_head = NULL;
+
+// 연결 탐색
+tcp_conn_t *find_conn(uint32_t s, uint32_t d, uint16_t sp, uint16_t dp) {
+    tcp_conn_t *cur = conn_head;
+    while (cur) {
+        if (cur->saddr == s && cur->daddr == d &&
+            cur->sport == sp && cur->dport == dp)
+            return cur;
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+// 연결 추가
+tcp_conn_t *add_conn(uint32_t s, uint32_t d, uint16_t sp, uint16_t dp) {
+    tcp_conn_t *c = malloc(sizeof(tcp_conn_t));
+    c->saddr = s;
+    c->daddr = d;
+    c->sport = sp;
+    c->dport = dp;
+    c->state = TCP_NONE;
+    c->next = conn_head;
+    conn_head = c;
+    return c;
+}
+
+// TCP 상태 출력
+void print_tcp_state(tcp_conn_t *c) {
+    struct in_addr s, d;
+    s.s_addr = c->saddr;
+    d.s_addr = c->daddr;
+    const char *st =
+        (c->state == TCP_SYN_SENT) ? "SYN_SENT" :
+        (c->state == TCP_SYN_RECV) ? "SYN_RECV" :
+        (c->state == TCP_ESTABLISHED) ? "ESTABLISHED" :
+        (c->state == TCP_FIN_WAIT) ? "FIN_WAIT" :
+        (c->state == TCP_CLOSED) ? "CLOSED" : "NONE";
+
+    printf("[TCP STATE] %s:%u -> %s:%u : %s\n",
+           inet_ntoa(s), ntohs(c->sport),
+           inet_ntoa(d), ntohs(c->dport),
+           st);
+}
+
+// TCP 상태 업데이트
+void update_tcp_state(tcp_conn_t *c, uint8_t flags) {
+    tcp_state_t prev = c->state;
+
+    if (flags & TH_SYN && !(flags & TH_ACK)) c->state = TCP_SYN_SENT;
+    else if (flags & TH_SYN && (flags & TH_ACK)) c->state = TCP_SYN_RECV;
+    else if ((flags & TH_ACK) && c->state == TCP_SYN_RECV) c->state = TCP_ESTABLISHED;
+    else if (flags & TH_FIN) c->state = TCP_FIN_WAIT;
+    else if (flags & TH_RST) c->state = TCP_CLOSED;
+
+    if (prev != c->state)
+        print_tcp_state(c);
+}
+
+
+// TCP/UDP 헤더 분석 함수
+void parse_transport(unsigned char *buffer, int size) {
+    struct iphdr *iph = (struct iphdr*)(buffer + sizeof(struct ethhdr));
+    int iphdr_len = iph->ihl * 4;
+
+    if (iph->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcph = (struct tcphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+
+        printf("----- TCP 헤더 -----\n");
+        printf("출발지 포트: %u\n", ntohs(tcph->source));
+        printf("목적지 포트: %u\n", ntohs(tcph->dest));
+
+        uint8_t flags = *((unsigned char*)tcph + 13);
+
+        // TCP 연결 추적
+        tcp_conn_t *c = find_conn(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+        if (!c) c = add_conn(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+
+        update_tcp_state(c, flags);
+
+        printf("--------------------\n");
+    }
+    else if (iph->protocol == IPPROTO_UDP) {
+        struct udphdr *udph = (struct udphdr*)(buffer + sizeof(struct ethhdr) + iphdr_len);
+
+        printf("----- UDP 헤더 -----\n");
+        printf("출발지 포트: %u\n", ntohs(udph->source));
+        printf("목적지 포트: %u\n", ntohs(udph->dest));
+        printf("길이: %u\n", ntohs(udph->len));
+        printf("--------------------\n");
+    }
+}
+
+int main() {
+    // raw socket 생성: 모든 프로토콜 패킷 수신
+    int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sockfd < 0) {
+        perror("소켓 생성 실패");
+        return 1;
+    }
+
+    unsigned char buffer[65536]; // 패킷 수신 버퍼
+
+    // 패킷 수신 루프
+    while (1) {
+        int size = recvfrom(sockfd, buffer, sizeof(buffer), 0, NULL, NULL);
+        if (size < 0) {
+            perror("수신 실패");
+            break;
+        }
+
+        // === (1) 원본 기능 ===
+        print_ip_header(buffer);
+
+        // === (2) 추가 기능: TCP/UDP 헤더 분석 ===
+        parse_transport(buffer, size);
+
+        printf("=================================\n");
+    }
+
+    close(sockfd); // 소켓 닫기
+    return 0;
+}
